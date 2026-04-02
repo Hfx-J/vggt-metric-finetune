@@ -1,4 +1,4 @@
-# vggt_scale_depth_v2.py
+# vggt_scale.py  (place at: vggt/models/vggt_scale.py)
 #
 # Adds a learnable scale_token to VGGT's alternating attention layers.
 # Token sequence after modification:
@@ -12,7 +12,6 @@
 import torch
 import torch.nn as nn
 from typing import List, Tuple
-from torch.utils.checkpoint import checkpoint
 
 from vggt.models.aggregator import Aggregator, slice_expand_and_flatten
 from vggt.models.vggt import VGGT
@@ -361,8 +360,9 @@ class VGGTScaleDepth(nn.Module):
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
         # ── 2. Extract scale token features from the last layer ───────────
+        # Cast to float32: scale_mlp is float32, bfloat16 input would crash.
         # last_output : [B, S, P, 2C]
-        last_output = aggregated_tokens_list[-1]
+        last_output = aggregated_tokens_list[-1].float()
 
         # Scale token is at fixed position self.scale_token_idx in every frame
         # shape: [B, S, 2C]
@@ -378,10 +378,13 @@ class VGGTScaleDepth(nn.Module):
             scale_factor = self.scale_mlp(scale_input)          # [B, 1]
 
         # ── 3. Relative depth from frozen DPT head ────────────────────────
+        # Cast tokens and images to float32: DPT head's LayerNorm requires it.
+        # autocast(enabled=False) alone is not enough when the tensors themselves
+        # are already bfloat16 coming from the aggregator.
         with torch.cuda.amp.autocast(enabled=False):
             depth_rel, depth_conf = self.depth_head(
-                aggregated_tokens_list,
-                images=images,
+                [t.float() for t in aggregated_tokens_list],
+                images=images.float(),
                 patch_start_idx=patch_start_idx,
             )
         # depth_rel : [B, S, H, W, 1]

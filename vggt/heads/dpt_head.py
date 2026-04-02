@@ -211,8 +211,8 @@ class DPTHead(nn.Module):
 
             x = x.reshape(B * S, -1, x.shape[-1])
 
-            x = self.norm(x)
-
+            # x = self.norm(x)
+            x = self.norm(x.to(next(self.norm.parameters()).dtype))
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
 
             x = self.projects[dpt_idx](x)

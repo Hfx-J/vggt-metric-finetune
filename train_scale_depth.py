@@ -10,7 +10,7 @@ from tqdm import tqdm
 import wandb
 
 from vggt.models.vggt import VGGT
-from vggt.models.vggt_scale_depth_v2 import VGGTScaleDepth
+from vggt.models.vggt_scale import VGGTScaleDepth
 from dataset_nyu import NYUv2Dataset
 
 CONFIG = {
@@ -105,10 +105,22 @@ def main():
         scale_per_frame=CONFIG["scale_per_frame"],
         img_size=CONFIG["img_size"],
     ).to(device)
-    # 注意：新增模块 (scale_mlp, fuse_conv) 是 float32
-    # aggregator 和 depth_head 保持 bfloat16
 
     del pretrained  # 释放显存
+
+    # ── ✅ 修复：统一 backbone 为 bfloat16，新增训练模块保持 float32 ──────────
+    # aggregator 和 depth_head 全部转为 bfloat16，保证内部 LayerNorm 等层
+    # 与前向传播中的激活值 dtype 一致，避免 "expected Float but found BFloat16"。
+    # Keep aggregator in bfloat16 for performance, but IMPORTANT: the DPT
+    # depth head contains LayerNorms that require float32 inputs/weights.
+    # `vggt/models/vggt_scale.py` explicitly casts tokens/images to float32
+    # before calling `depth_head`. Therefore keep `depth_head` in float32 to
+    # avoid input/weight dtype mismatches (conv/LayerNorm errors).
+    model.aggregator.to(dtype)
+    model.depth_head.to(torch.float32)
+    # scale_mlp / fuse_conv 保持 float32，训练更稳定（梯度精度更高）
+    model.scale_mlp.to(torch.float32)
+    model.fuse_conv.to(torch.float32)
 
     if is_main():
         total     = sum(p.numel() for p in model.parameters())
@@ -180,9 +192,8 @@ def main():
             gt_depth = batch["depth"].to(device).float()                 # [B,H,W]
 
             # ── 前向 ─────────────────────────────────────────────────────
-            # 不需要手动拆开 aggregator / depth_head：
-            # 冻结参数 requires_grad=False，PyTorch 自动跳过，
-            # 只有 scale_token / scale_mlp / fuse_conv 会累积梯度。
+            # aggregator / depth_head 已统一为 bfloat16，autocast 保持一致即可。
+            # scale_mlp / fuse_conv 是 float32，模型内部负责在边界做 cast。
             with torch.cuda.amp.autocast(dtype=dtype):
                 out = model(images)
 
