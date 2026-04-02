@@ -19,7 +19,7 @@ CONFIG = {
     "max_depth": 10.0,
     "batch_size": 8,
     "num_epochs": 50,
-    "lr_adapter":    5e-4,                             # ← 改：adapter 学习率
+    "lr_adapter":    5e-3,                             # ← 改：adapter 学习率
     "lr_depth_head": 1e-7,                             # ← 新增：depth_head 用更小的 lr
     "weight_decay": 1e-4,
     "save_dir": "./checkpoints",
