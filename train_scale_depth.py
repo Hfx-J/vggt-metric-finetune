@@ -17,19 +17,30 @@ CONFIG = {
     "mat_path":           "/root/autodl-tmp/nyu_depth_v2_labeled_baidu.mat",
     "img_size":           518,
     "max_depth":          10.0,
-    "batch_size":         4,            # depth_head 微调显存开销大，从 2 开始
+    "batch_size":         4,
     "num_epochs":         50,
-    "lr_new":             1e-3,         # scale_token / scale_mlp / fuse_conv
-    "lr_depth_head":      1e-6,         # depth_head 微调学习率（比新增模块低 100x）
+    # ── Learning rates ────────────────────────────────────────────────────
+    "lr_new":             1e-3,   # scale_token / scale_mlp / fuse_conv
+    "lr_lora":            1e-4,   # LoRA A/B matrices in the backbone
+    "lr_depth_head":      1e-6,   # depth_head fine-tune (100× smaller)
     "weight_decay":       1e-4,
-    "freeze_depth_head":  False,        # ← True = 冻结 depth_head；False = 微调
+    # ── Freeze flags ─────────────────────────────────────────────────────
+    "freeze_depth_head":  False,  # True = freeze depth_head entirely
+    # ── LoRA config ───────────────────────────────────────────────────────
+    "lora_rank":          8,      # 0 = disable LoRA (backbone fully frozen)
+    "lora_alpha":         16.0,   # scaling = alpha / rank  →  2.0
+    "lora_dropout":       0.05,
+    # Which sub-modules inside each transformer block to adapt.
+    # For a pure attention-only LoRA remove "mlp.fc1" / "mlp.fc2".
+    "lora_targets": ("attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"),
+    # ── Misc ──────────────────────────────────────────────────────────────
     "save_dir":           "./checkpoints_scale",
     "log_interval":       20,
     "val_interval":       1,
     "scale_per_frame":    False,
     "lambda_l1":          0.1,
     "wandb_project":      "vggt-scale-depth",
-    "wandb_run_name":     "scale-token-dpt-finetune-v1",
+    "wandb_run_name":     "scale-token-lora-dpt-finetune-v1",
 }
 
 
@@ -99,23 +110,32 @@ def main():
     pretrained = VGGT.from_pretrained("facebook/VGGT-1B").to(device).to(dtype)
 
     if is_main():
-        print(f"Building VGGTScaleDepth "
-              f"(freeze_depth_head={CONFIG['freeze_depth_head']})...")
+        print(
+            f"Building VGGTScaleDepth ("
+            f"lora_rank={CONFIG['lora_rank']}, "
+            f"freeze_depth_head={CONFIG['freeze_depth_head']})..."
+        )
     model = VGGTScaleDepth(
         pretrained_vggt=pretrained,
         embed_dim=1024,
-        freeze_backbone=True,
-        freeze_depth_head=CONFIG["freeze_depth_head"],   # ← 新增
+        freeze_backbone=True,           # non-LoRA aggregator weights frozen
+        freeze_depth_head=CONFIG["freeze_depth_head"],
         scale_per_frame=CONFIG["scale_per_frame"],
         img_size=CONFIG["img_size"],
+        lora_rank=CONFIG["lora_rank"],
+        lora_alpha=CONFIG["lora_alpha"],
+        lora_dropout=CONFIG["lora_dropout"],
+        lora_targets=CONFIG["lora_targets"],
     ).to(device)
 
     del pretrained
 
-    # ── dtype 设置 ─────────────────────────────────────────────────────────
-    # aggregator      → bfloat16（推理加速）
-    # depth_head      → float32（LayerNorm 需要；微调时梯度精度更高）
-    # scale_mlp/fuse  → float32
+    # ── dtype partitioning ────────────────────────────────────────────────
+    # • aggregator (incl. LoRA layers) → bfloat16 for throughput
+    # • depth_head / scale_mlp / fuse_conv → float32 for LayerNorm stability
+    # Note: LoRALinear stores weight frozen in bfloat16 but keeps A/B in
+    # float32 to avoid under-flow in small gradients.  The forward() cast
+    # handles dtype promotion automatically.
     model.aggregator.to(dtype)
     model.depth_head.to(torch.float32)
     model.scale_mlp.to(torch.float32)
@@ -124,9 +144,14 @@ def main():
     if is_main():
         total     = sum(p.numel() for p in model.parameters())
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total:     {total / 1e6:.1f}M params")
-        print(f"Trainable: {trainable / 1e6:.3f}M params")
-        for g in (model.module if use_ddp else model).trainable_parameter_groups():
+        print(f"Total params    : {total     / 1e6:.1f}M")
+        print(f"Trainable params: {trainable / 1e6:.3f}M  "
+              f"({100 * trainable / total:.2f}%)")
+        raw = model
+        for g in raw.trainable_parameter_groups(
+            depth_head_lr=CONFIG["lr_depth_head"],
+            lora_lr=CONFIG["lr_lora"],
+        ):
             n = sum(p.numel() for p in g["params"])
             print(f"  {g['name']:20s}: {n / 1e6:.3f}M  lr={g['lr']}")
 
@@ -162,11 +187,10 @@ def main():
     )
 
     # ── 4. 优化器 ─────────────────────────────────────────────────────────────
-    # trainable_parameter_groups() 会根据 freeze_depth_head 自动决定
-    # 是否把 depth_head 参数加入优化器，并使用 lr_depth_head 的学习率。
     optimizer = torch.optim.AdamW(
         raw_model.trainable_parameter_groups(
-            depth_head_lr=CONFIG["lr_depth_head"]
+            depth_head_lr=CONFIG["lr_depth_head"],
+            lora_lr=CONFIG["lr_lora"],
         ),
         weight_decay=CONFIG["weight_decay"],
     )
@@ -225,6 +249,11 @@ def main():
             if is_main() and (step + 1) % CONFIG["log_interval"] == 0:
                 scale_val = out["scale_factor"].float().mean().item()
 
+                # ── gradient norm helpers ──────────────────────────────
+                def _grad_norm(params):
+                    gs = [p.grad.norm().item() for p in params if p.grad is not None]
+                    return sum(gs) / len(gs) if gs else 0.0
+
                 log_dict = {
                     "train/loss_step":  loss.item(),
                     "train/silog_step": loss_silog.item(),
@@ -237,19 +266,30 @@ def main():
                     ),
                 }
 
-                # 当 depth_head 参与训练时，额外监控其梯度范数
-                if not CONFIG["freeze_depth_head"]:
-                    dpt_grads = [
-                        p.grad.norm().item()
-                        for p in raw_model.depth_head.parameters()
-                        if p.grad is not None
+                # LoRA gradient norms (A and B separately)
+                if CONFIG["lora_rank"] > 0:
+                    from vggt.models.vggt_scale import LoRALinear
+                    lora_modules = [
+                        m for m in raw_model.aggregator.modules()
+                        if isinstance(m, LoRALinear)
                     ]
-                    if dpt_grads:
-                        log_dict["grad/depth_head"] = sum(dpt_grads) / len(dpt_grads)
+                    log_dict["grad/lora_A"] = _grad_norm(
+                        [m.lora_A for m in lora_modules]
+                    )
+                    log_dict["grad/lora_B"] = _grad_norm(
+                        [m.lora_B for m in lora_modules]
+                    )
 
-                print(f"  step {step + 1}: loss={loss.item():.4f} "
-                      f"(silog={loss_silog.item():.4f}, l1={loss_l1.item():.4f}) "
-                      f"scale={scale_val:.4f}")
+                if not CONFIG["freeze_depth_head"]:
+                    log_dict["grad/depth_head"] = _grad_norm(
+                        raw_model.depth_head.parameters()
+                    )
+
+                print(
+                    f"  step {step + 1}: loss={loss.item():.4f} "
+                    f"(silog={loss_silog.item():.4f}, l1={loss_l1.item():.4f}) "
+                    f"scale={scale_val:.4f}"
+                )
                 wandb.log(log_dict, step=global_step)
 
         scheduler.step()
@@ -257,12 +297,17 @@ def main():
         if is_main():
             n = len(train_loader)
             print(f"Epoch {epoch + 1} avg loss: {total_loss / n:.4f}")
+
+            # find lr for each group by name
+            lr_by_name = {g["name"]: g["lr"] for g in optimizer.param_groups
+                          if "name" in g}
             wandb.log({
                 "train/loss_epoch":  total_loss  / n,
                 "train/silog_epoch": total_silog / n,
                 "train/l1_epoch":    total_l1    / n,
-                "train/lr_new":      optimizer.param_groups[0]["lr"],
-                "train/lr_dpt":      optimizer.param_groups[-1]["lr"],
+                "train/lr_new":      lr_by_name.get("scale_token", 0.0),
+                "train/lr_lora":     lr_by_name.get("lora",        0.0),
+                "train/lr_dpt":      lr_by_name.get("depth_head",  0.0),
                 "epoch":             epoch + 1,
             }, step=global_step)
 
@@ -297,10 +342,12 @@ def main():
             avg       = {k: sum(v) / len(v) for k, v in all_metrics.items()}
             avg_scale = sum(scale_list) / len(scale_list)
 
-            print(f"\n📊 Val (Epoch {epoch + 1}): "
-                  f"AbsRel={avg['abs_rel']:.4f}  RMSE={avg['rmse']:.4f}  "
-                  f"δ1={avg['d1']:.4f}  δ2={avg['d2']:.4f}  "
-                  f"scale={avg_scale:.4f}")
+            print(
+                f"\n📊 Val (Epoch {epoch + 1}): "
+                f"AbsRel={avg['abs_rel']:.4f}  RMSE={avg['rmse']:.4f}  "
+                f"δ1={avg['d1']:.4f}  δ2={avg['d2']:.4f}  "
+                f"scale={avg_scale:.4f}"
+            )
 
             wandb.log({
                 "val/abs_rel":   avg["abs_rel"],
@@ -313,21 +360,23 @@ def main():
             if avg["abs_rel"] < best_abs_rel:
                 best_abs_rel = avg["abs_rel"]
 
+                # ── Compact checkpoint: only adapted weights ──────────
                 ckpt = {
-                    "epoch":            epoch + 1,
-                    "scale_token":      raw_model.aggregator.scale_token.data,
-                    "scale_mlp_state":  raw_model.scale_mlp.state_dict(),
-                    "fuse_conv_state":  raw_model.fuse_conv.state_dict(),
-                    "optimizer_state":  optimizer.state_dict(),
-                    "metrics":          avg,
-                    "config":           CONFIG,
+                    "epoch":           epoch + 1,
+                    "lora_rank":       CONFIG["lora_rank"],
+                    "lora_alpha":      CONFIG["lora_alpha"],
+                    # lora_state_dict includes LoRA A/B + scale_token
+                    # + scale_mlp + fuse_conv (+ depth_head if trained)
+                    "adapter_state":   raw_model.lora_state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "metrics":         avg,
+                    "config":          CONFIG,
                 }
 
-                # depth_head 微调时一并保存，冻结时无需保存（不变）
-                if not CONFIG["freeze_depth_head"]:
-                    ckpt["depth_head_state"] = raw_model.depth_head.state_dict()
-
-                torch.save(ckpt, os.path.join(CONFIG["save_dir"], "best_ckpt.pth"))
+                torch.save(
+                    ckpt,
+                    os.path.join(CONFIG["save_dir"], "best_ckpt.pth")
+                )
                 print(f"   ✅ Saved best (AbsRel={best_abs_rel:.4f})")
                 wandb.run.summary["best_abs_rel"] = best_abs_rel
                 wandb.run.summary["best_epoch"]   = epoch + 1
