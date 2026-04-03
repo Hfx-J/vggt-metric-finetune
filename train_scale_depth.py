@@ -14,20 +14,22 @@ from vggt.models.vggt_scale import VGGTScaleDepth
 from dataset_nyu import NYUv2Dataset
 
 CONFIG = {
-    "mat_path":        "/root/autodl-tmp/nyu_depth_v2_labeled_baidu.mat",
-    "img_size":        518,
-    "max_depth":       10.0,
-    "batch_size":      4,           # scale token 训练比 adapter 稍省显存
-    "num_epochs":      50,
-    "lr_new":          1e-3,        # scale_token / scale_mlp / fuse_conv
-    "weight_decay":    1e-4,
-    "save_dir":        "./checkpoints_scale",
-    "log_interval":    20,
-    "val_interval":    1,
-    "scale_per_frame": False,       # True = 每帧独立 scale，False = 每个场景一个 scale
-    "lambda_l1":       0.1,
-    "wandb_project":   "vggt-scale-depth",
-    "wandb_run_name":  "scale-token-finetune-v1",
+    "mat_path":           "/root/autodl-tmp/nyu_depth_v2_labeled_baidu.mat",
+    "img_size":           518,
+    "max_depth":          10.0,
+    "batch_size":         4,            # depth_head 微调显存开销大，从 2 开始
+    "num_epochs":         50,
+    "lr_new":             1e-3,         # scale_token / scale_mlp / fuse_conv
+    "lr_depth_head":      1e-8,         # depth_head 微调学习率（比新增模块低 100x）
+    "weight_decay":       1e-4,
+    "freeze_depth_head":  False,        # ← True = 冻结 depth_head；False = 微调
+    "save_dir":           "./checkpoints_scale",
+    "log_interval":       20,
+    "val_interval":       1,
+    "scale_per_frame":    False,
+    "lambda_l1":          0.1,
+    "wandb_project":      "vggt-scale-depth",
+    "wandb_run_name":     "scale-token-dpt-finetune-v1",
 }
 
 
@@ -97,28 +99,25 @@ def main():
     pretrained = VGGT.from_pretrained("facebook/VGGT-1B").to(device).to(dtype)
 
     if is_main():
-        print("Building VGGTScaleDepth (freeze_backbone=True)...")
+        print(f"Building VGGTScaleDepth "
+              f"(freeze_depth_head={CONFIG['freeze_depth_head']})...")
     model = VGGTScaleDepth(
         pretrained_vggt=pretrained,
         embed_dim=1024,
-        freeze_backbone=True,           # aggregator 除 scale_token 外全冻结
+        freeze_backbone=True,
+        freeze_depth_head=CONFIG["freeze_depth_head"],   # ← 新增
         scale_per_frame=CONFIG["scale_per_frame"],
         img_size=CONFIG["img_size"],
     ).to(device)
 
-    del pretrained  # 释放显存
+    del pretrained
 
-    # ── ✅ 修复：统一 backbone 为 bfloat16，新增训练模块保持 float32 ──────────
-    # aggregator 和 depth_head 全部转为 bfloat16，保证内部 LayerNorm 等层
-    # 与前向传播中的激活值 dtype 一致，避免 "expected Float but found BFloat16"。
-    # Keep aggregator in bfloat16 for performance, but IMPORTANT: the DPT
-    # depth head contains LayerNorms that require float32 inputs/weights.
-    # `vggt/models/vggt_scale.py` explicitly casts tokens/images to float32
-    # before calling `depth_head`. Therefore keep `depth_head` in float32 to
-    # avoid input/weight dtype mismatches (conv/LayerNorm errors).
+    # ── dtype 设置 ─────────────────────────────────────────────────────────
+    # aggregator      → bfloat16（推理加速）
+    # depth_head      → float32（LayerNorm 需要；微调时梯度精度更高）
+    # scale_mlp/fuse  → float32
     model.aggregator.to(dtype)
     model.depth_head.to(torch.float32)
-    # scale_mlp / fuse_conv 保持 float32，训练更稳定（梯度精度更高）
     model.scale_mlp.to(torch.float32)
     model.fuse_conv.to(torch.float32)
 
@@ -126,15 +125,15 @@ def main():
         total     = sum(p.numel() for p in model.parameters())
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Total:     {total / 1e6:.1f}M params")
-        print(f"Trainable: {trainable / 1e6:.3f}M params "
-              f"(scale_token + scale_mlp + fuse_conv)")
-        print(f"scale_token_idx = {model.scale_token_idx}")
-        print(f"patch_start_idx = {model.aggregator.patch_start_idx}")
+        print(f"Trainable: {trainable / 1e6:.3f}M params")
+        for g in (model.module if use_ddp else model).trainable_parameter_groups():
+            n = sum(p.numel() for p in g["params"])
+            print(f"  {g['name']:20s}: {n / 1e6:.3f}M  lr={g['lr']}")
 
     # ── 2. DDP ───────────────────────────────────────────────────────────────
     if use_ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    raw_model = model.module if use_ddp else model  # 用于访问内部属性
+    raw_model = model.module if use_ddp else model
 
     # ── 3. 数据集 ────────────────────────────────────────────────────────────
     train_dataset = NYUv2Dataset(
@@ -162,9 +161,13 @@ def main():
         num_workers=4, pin_memory=True,
     )
 
-    # ── 4. 优化器（只优化新增的三组参数）────────────────────────────────────
+    # ── 4. 优化器 ─────────────────────────────────────────────────────────────
+    # trainable_parameter_groups() 会根据 freeze_depth_head 自动决定
+    # 是否把 depth_head 参数加入优化器，并使用 lr_depth_head 的学习率。
     optimizer = torch.optim.AdamW(
-        raw_model.trainable_parameter_groups(),     # scale_token / mlp / fuse
+        raw_model.trainable_parameter_groups(
+            depth_head_lr=CONFIG["lr_depth_head"]
+        ),
         weight_decay=CONFIG["weight_decay"],
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -187,17 +190,12 @@ def main():
         for step, batch in enumerate(
             tqdm(train_loader, desc=f"Epoch {epoch + 1}", disable=not is_main())
         ):
-            # NYUv2Dataset 返回单帧图像，unsqueeze(1) 变成 S=1 的序列
             images   = batch["image"].unsqueeze(1).to(device).to(dtype)  # [B,1,3,H,W]
-            gt_depth = batch["depth"].to(device).float()                 # [B,H,W]
+            gt_depth = batch["depth"].to(device).float()                  # [B,H,W]
 
-            # ── 前向 ─────────────────────────────────────────────────────
-            # aggregator / depth_head 已统一为 bfloat16，autocast 保持一致即可。
-            # scale_mlp / fuse_conv 是 float32，模型内部负责在边界做 cast。
             with torch.cuda.amp.autocast(dtype=dtype):
                 out = model(images)
 
-            # depth: [B, 1, H, W, 1] → [B, H, W]
             pred_depth = out["depth"].squeeze(1).squeeze(-1).float()
 
             pred_flat   = pred_depth.reshape(-1)
@@ -214,7 +212,6 @@ def main():
             optimizer.zero_grad()
             loss.backward()
 
-            # 梯度裁剪（只对可训练参数）
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], 1.0
             )
@@ -227,21 +224,33 @@ def main():
 
             if is_main() and (step + 1) % CONFIG["log_interval"] == 0:
                 scale_val = out["scale_factor"].float().mean().item()
-                print(f"  step {step + 1}: loss={loss.item():.4f} "
-                      f"(silog={loss_silog.item():.4f}, l1={loss_l1.item():.4f}) "
-                      f"scale={scale_val:.4f}")
-                wandb.log({
+
+                log_dict = {
                     "train/loss_step":  loss.item(),
                     "train/silog_step": loss_silog.item(),
                     "train/l1_step":    loss_l1.item(),
                     "train/scale_mean": scale_val,
                     "train/scale_std":  out["scale_factor"].float().std().item(),
-                    # 监控 scale_token 梯度范数
                     "grad/scale_token": (
                         raw_model.aggregator.scale_token.grad.norm().item()
                         if raw_model.aggregator.scale_token.grad is not None else 0.0
                     ),
-                }, step=global_step)
+                }
+
+                # 当 depth_head 参与训练时，额外监控其梯度范数
+                if not CONFIG["freeze_depth_head"]:
+                    dpt_grads = [
+                        p.grad.norm().item()
+                        for p in raw_model.depth_head.parameters()
+                        if p.grad is not None
+                    ]
+                    if dpt_grads:
+                        log_dict["grad/depth_head"] = sum(dpt_grads) / len(dpt_grads)
+
+                print(f"  step {step + 1}: loss={loss.item():.4f} "
+                      f"(silog={loss_silog.item():.4f}, l1={loss_l1.item():.4f}) "
+                      f"scale={scale_val:.4f}")
+                wandb.log(log_dict, step=global_step)
 
         scheduler.step()
 
@@ -252,7 +261,8 @@ def main():
                 "train/loss_epoch":  total_loss  / n,
                 "train/silog_epoch": total_silog / n,
                 "train/l1_epoch":    total_l1    / n,
-                "train/lr":          optimizer.param_groups[0]["lr"],
+                "train/lr_new":      optimizer.param_groups[0]["lr"],
+                "train/lr_dpt":      optimizer.param_groups[-1]["lr"],
                 "epoch":             epoch + 1,
             }, step=global_step)
 
@@ -284,7 +294,7 @@ def main():
                     for k, v in m.items():
                         all_metrics[k].append(v)
 
-            avg = {k: sum(v) / len(v) for k, v in all_metrics.items()}
+            avg       = {k: sum(v) / len(v) for k, v in all_metrics.items()}
             avg_scale = sum(scale_list) / len(scale_list)
 
             print(f"\n📊 Val (Epoch {epoch + 1}): "
@@ -302,7 +312,8 @@ def main():
 
             if avg["abs_rel"] < best_abs_rel:
                 best_abs_rel = avg["abs_rel"]
-                torch.save({
+
+                ckpt = {
                     "epoch":            epoch + 1,
                     "scale_token":      raw_model.aggregator.scale_token.data,
                     "scale_mlp_state":  raw_model.scale_mlp.state_dict(),
@@ -310,7 +321,13 @@ def main():
                     "optimizer_state":  optimizer.state_dict(),
                     "metrics":          avg,
                     "config":           CONFIG,
-                }, os.path.join(CONFIG["save_dir"], "best_ckpt.pth"))
+                }
+
+                # depth_head 微调时一并保存，冻结时无需保存（不变）
+                if not CONFIG["freeze_depth_head"]:
+                    ckpt["depth_head_state"] = raw_model.depth_head.state_dict()
+
+                torch.save(ckpt, os.path.join(CONFIG["save_dir"], "best_ckpt.pth"))
                 print(f"   ✅ Saved best (AbsRel={best_abs_rel:.4f})")
                 wandb.run.summary["best_abs_rel"] = best_abs_rel
                 wandb.run.summary["best_epoch"]   = epoch + 1

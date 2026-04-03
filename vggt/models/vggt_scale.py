@@ -78,18 +78,15 @@ class AggregatorWithScaleToken(Aggregator):
             img_size       : must match what VGGT was trained with (default 518)
             patch_embed    : patch-embed type string used in the original model
         """
-        # Infer architecture from stored attributes
-        embed_dim          = pretrained_agg.camera_token.shape[-1]
-        depth              = pretrained_agg.depth
-        patch_size         = pretrained_agg.patch_size
+        embed_dim           = pretrained_agg.camera_token.shape[-1]
+        depth               = pretrained_agg.depth
+        patch_size          = pretrained_agg.patch_size
         num_register_tokens = pretrained_agg.register_token.shape[2]
-        aa_order           = pretrained_agg.aa_order
-        aa_block_size      = pretrained_agg.aa_block_size
-        has_rope           = pretrained_agg.rope is not None
+        aa_order            = pretrained_agg.aa_order
+        aa_block_size       = pretrained_agg.aa_block_size
+        has_rope            = pretrained_agg.rope is not None
 
-        # Infer num_heads from the first frame block
         first_block = pretrained_agg.frame_blocks[0]
-        # Most block implementations store num_heads on the attn sub-module
         num_heads = getattr(
             getattr(first_block, "attn", first_block), "num_heads", 16
         )
@@ -107,13 +104,12 @@ class AggregatorWithScaleToken(Aggregator):
             rope_freq=100 if has_rope else -1,
         )
 
-        # Copy all pretrained weights; scale_token will be missing from the
-        # pretrained state dict → reported in `missing_keys` but that's fine.
         missing, unexpected = new_agg.load_state_dict(
             pretrained_agg.state_dict(), strict=False
         )
         assert all("scale_token" in k for k in missing), (
-            f"Unexpected missing keys (not scale_token): {[k for k in missing if 'scale_token' not in k]}"
+            f"Unexpected missing keys (not scale_token): "
+            f"{[k for k in missing if 'scale_token' not in k]}"
         )
 
         return new_agg
@@ -126,44 +122,37 @@ class AggregatorWithScaleToken(Aggregator):
         between register_token and patch_tokens.
 
         Returns:
-            output_list     : list of [B, S, P+1, 2·C] tensors   (P+1 because of scale_token)
-            patch_start_idx : 6 (updated to reflect the extra scale token slot)
+            output_list     : list of [B, S, P+1, 2·C] tensors
+            patch_start_idx : 6
         """
         B, S, C_in, H, W = images.shape
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
-        # Normalize
         images = (images - self._resnet_mean) / self._resnet_std
         images = images.view(B * S, C_in, H, W)
 
-        # Patch embedding
         patch_tokens = self.patch_embed(images)
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P_patch, C = patch_tokens.shape
 
-        # Expand special tokens → [B*S, *, C]
         camera_token_e   = slice_expand_and_flatten(self.camera_token,   B, S)
         register_token_e = slice_expand_and_flatten(self.register_token, B, S)
-        scale_token_e    = slice_expand_and_flatten(self.scale_token,    B, S)  # NEW
+        scale_token_e    = slice_expand_and_flatten(self.scale_token,    B, S)
 
-        # Concatenate: [camera | register | scale | patches]
         tokens = torch.cat(
             [camera_token_e, register_token_e, scale_token_e, patch_tokens], dim=1
         )
 
-        # Rotary position embedding
         pos = None
         if self.rope is not None:
             pos = self.position_getter(
                 B * S, H // self.patch_size, W // self.patch_size,
                 device=images.device
             )
-            # Shift patch positions by +1 (away from 0-origin), then zero-pad
-            # for all special tokens (camera, register, scale).
             pos = pos + 1
             pos_special = torch.zeros(
                 B * S, self.patch_start_idx, 2,
@@ -171,7 +160,7 @@ class AggregatorWithScaleToken(Aggregator):
             )
             pos = torch.cat([pos_special, pos], dim=1)
 
-        _, P, C = tokens.shape   # P = 1 + 4 + 1 + P_patch = 6 + P_patch
+        _, P, C = tokens.shape
 
         frame_idx  = 0
         global_idx = 0
@@ -195,7 +184,6 @@ class AggregatorWithScaleToken(Aggregator):
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
             for i in range(len(frame_intermediates)):
-                # [B, S, P, 2C]  (frame ‖ global concatenation, same as original)
                 concat_inter = torch.cat(
                     [frame_intermediates[i], global_intermediates[i]], dim=-1
                 )
@@ -203,7 +191,6 @@ class AggregatorWithScaleToken(Aggregator):
 
         del concat_inter, frame_intermediates, global_intermediates
 
-        # patch_start_idx = 6, correctly signals DPT head where patches begin
         return output_list, self.patch_start_idx
 
 
@@ -215,9 +202,8 @@ class ScaleMLP(nn.Module):
     """
     Estimates a positive scale factor from the scale_token's feature vector.
 
-    Input : [B, 2·embed_dim]  (the scale token's last-layer representation,
-                               after concatenating frame and global features)
-    Output: [B, 1]            (positive scalar via Softplus)
+    Input : [B, 2·embed_dim]
+    Output: [B, 1]  (positive scalar via Softplus)
     """
 
     def __init__(self, dim_in: int):
@@ -233,20 +219,18 @@ class ScaleMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)   # [B, 1]
+        return self.net(x)
 
 
 class FuseConv(nn.Module):
     """
-    Fuses relative depth + scale into an absolute depth map using a small
-    residual conv.  Residual design means the conv starts as a near-identity
-    (predicted increment ≈ 0 at init), so training is stable from day one.
+    Fuses relative depth + scale into absolute depth via a small residual conv.
 
     Input:
-        depth_rel  [N, 1, H, W]  relative depth from DPT head
-        scale_map  [N, 1, H, W]  broadcasted scale factor
+        depth_rel  [N, 1, H, W]
+        scale_map  [N, 1, H, W]
     Output:
-        [N, 1, H, W]  absolute depth
+        [N, 1, H, W]
     """
 
     def __init__(self):
@@ -256,9 +240,8 @@ class FuseConv(nn.Module):
             nn.GELU(),
             nn.Conv2d(32, 16, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(16, 1,  kernel_size=1),
+            nn.Conv2d(16, 1, kernel_size=1),
         )
-        # Zero-init last conv so the residual starts as identity
         nn.init.zeros_(self.conv[-1].weight)
         nn.init.zeros_(self.conv[-1].bias)
 
@@ -269,7 +252,7 @@ class FuseConv(nn.Module):
     ) -> torch.Tensor:
         scaled  = depth_rel * scale_map
         refined = self.conv(torch.cat([scaled, scale_map], dim=1))
-        return scaled + refined   # residual
+        return scaled + refined
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -281,21 +264,18 @@ class VGGTScaleDepth(nn.Module):
     Wraps a pretrained VGGT and adds absolute-scale depth estimation.
 
     Architecture changes vs. stock VGGT:
-        • Aggregator  → AggregatorWithScaleToken  (scale_token added, rest frozen)
-        • scale_mlp   — new, trainable
-        • fuse_conv   — new, trainable
-        • depth_head  — unchanged, frozen by default
-
-    Trainable parameter count is tiny (< 1M for embed_dim=1024).
+        • Aggregator       → AggregatorWithScaleToken  (scale_token added)
+        • scale_mlp        — new, always trainable
+        • fuse_conv        — new, always trainable
+        • depth_head       — trainable when freeze_depth_head=False
 
     Args:
-        pretrained_vggt  : loaded VGGT instance (weights already on device)
-        embed_dim        : must match pretrained model (default 1024 for VGGT-1B)
-        freeze_backbone  : freeze depth_head and all aggregator weights except
-                           scale_token  (recommended for initial experiments)
-        scale_per_frame  : if True, predict one scale per frame rather than
-                           one per scene/batch
-        img_size         : image size used for positional embedding init (default 518)
+        pretrained_vggt   : loaded VGGT instance
+        embed_dim         : must match pretrained model (default 1024)
+        freeze_backbone   : freeze aggregator weights except scale_token
+        freeze_depth_head : freeze depth_head weights (set False to finetune)
+        scale_per_frame   : predict one scale per frame vs. per scene
+        img_size          : image size for positional embedding (default 518)
     """
 
     def __init__(
@@ -303,6 +283,7 @@ class VGGTScaleDepth(nn.Module):
         pretrained_vggt: VGGT,
         embed_dim: int = 1024,
         freeze_backbone: bool = True,
+        freeze_depth_head: bool = True,
         scale_per_frame: bool = False,
         img_size: int = 518,
     ):
@@ -322,21 +303,20 @@ class VGGTScaleDepth(nn.Module):
         self.depth_head = pretrained_vggt.depth_head
 
         # ── New trainable modules ─────────────────────────────────────────
-        dim_agg = 2 * embed_dim          # aggregator outputs concat(frame, global) = 2C
-        self.scale_mlp  = ScaleMLP(dim_in=dim_agg)
-        self.fuse_conv  = FuseConv()
+        dim_agg = 2 * embed_dim
+        self.scale_mlp       = ScaleMLP(dim_in=dim_agg)
+        self.fuse_conv       = FuseConv()
         self.scale_per_frame = scale_per_frame
 
-        # ── Freeze pretrained weights ─────────────────────────────────────
+        # ── Freeze pretrained aggregator weights (except scale_token) ─────
         if freeze_backbone:
-            # Freeze depth_head entirely
-            for p in self.depth_head.parameters():
-                p.requires_grad = False
-
-            # Freeze all aggregator weights EXCEPT the new scale_token
             for name, p in self.aggregator.named_parameters():
                 if name != "scale_token":
                     p.requires_grad = False
+
+        # ── depth_head: freeze or unfreeze ───────────────────────────────
+        for p in self.depth_head.parameters():
+            p.requires_grad = not freeze_depth_head
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
@@ -346,41 +326,30 @@ class VGGTScaleDepth(nn.Module):
             images : [S, 3, H, W] or [B, S, 3, H, W], values ∈ [0, 1]
 
         Returns dict:
-            depth         [B, S, H, W, 1]   absolute depth
-            depth_conf    [B, S, H, W]       confidence from DPT head
-            scale_factor  [B, 1] or [B, S, 1]
+            depth         [B, S, H, W, 1]
+            depth_conf    [B, S, H, W]
+            scale_factor  [B, 1] or [B*S, 1]
         """
         if images.ndim == 4:
             images = images.unsqueeze(0)
         B, S = images.shape[:2]
 
-        # ── 1. Run modified aggregator ────────────────────────────────────
-        # output_list : list of [B, S, P, 2C], P = 6 + num_patches
-        # patch_start_idx = 6
+        # ── 1. Modified aggregator ────────────────────────────────────────
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
-        # ── 2. Extract scale token features from the last layer ───────────
-        # Cast to float32: scale_mlp is float32, bfloat16 input would crash.
-        # last_output : [B, S, P, 2C]
-        last_output = aggregated_tokens_list[-1].float()
-
-        # Scale token is at fixed position self.scale_token_idx in every frame
-        # shape: [B, S, 2C]
-        scale_tok_feats = last_output[:, :, self.scale_token_idx, :]
+        # ── 2. Scale token → scale factor ────────────────────────────────
+        last_output     = aggregated_tokens_list[-1].float()           # [B, S, P, 2C]
+        scale_tok_feats = last_output[:, :, self.scale_token_idx, :]   # [B, S, 2C]
 
         if self.scale_per_frame:
-            # One scale per (batch, frame) — reshape [B*S, 2C] → [B*S, 1]
             scale_input  = scale_tok_feats.reshape(B * S, -1)
-            scale_factor = self.scale_mlp(scale_input)          # [B*S, 1]
+            scale_factor = self.scale_mlp(scale_input)    # [B*S, 1]
         else:
-            # One scale per scene — mean-pool over S frames first
-            scale_input  = scale_tok_feats.mean(dim=1)          # [B, 2C]
-            scale_factor = self.scale_mlp(scale_input)          # [B, 1]
+            scale_input  = scale_tok_feats.mean(dim=1)    # [B, 2C]
+            scale_factor = self.scale_mlp(scale_input)    # [B, 1]
 
-        # ── 3. Relative depth from frozen DPT head ────────────────────────
-        # Cast tokens and images to float32: DPT head's LayerNorm requires it.
-        # autocast(enabled=False) alone is not enough when the tensors themselves
-        # are already bfloat16 coming from the aggregator.
+        # ── 3. Relative depth from depth_head ────────────────────────────
+        # Cast to float32: depth_head's LayerNorm requires float32 inputs.
         with torch.cuda.amp.autocast(enabled=False):
             depth_rel, depth_conf = self.depth_head(
                 [t.float() for t in aggregated_tokens_list],
@@ -390,23 +359,21 @@ class VGGTScaleDepth(nn.Module):
         # depth_rel : [B, S, H, W, 1]
 
         # ── 4. Fuse scale + relative depth ────────────────────────────────
-        H, W = depth_rel.shape[2], depth_rel.shape[3]
-
-        # Flatten to [B*S, 1, H, W] for conv
+        H, W       = depth_rel.shape[2], depth_rel.shape[3]
         depth_flat = depth_rel.squeeze(-1).reshape(B * S, 1, H, W)
 
         if self.scale_per_frame:
             scale_flat = scale_factor.reshape(B * S, 1, 1, 1).expand(B * S, 1, H, W)
         else:
             scale_flat = (
-                scale_factor                                     # [B, 1]
-                .unsqueeze(1).expand(B, S, 1)                   # [B, S, 1]
+                scale_factor
+                .unsqueeze(1).expand(B, S, 1)
                 .reshape(B * S, 1, 1, 1)
                 .expand(B * S, 1, H, W)
             )
 
-        depth_abs  = self.fuse_conv(depth_flat, scale_flat)     # [B*S, 1, H, W]
-        depth_out  = depth_abs.reshape(B, S, H, W, 1)
+        depth_abs = self.fuse_conv(depth_flat, scale_flat)   # [B*S, 1, H, W]
+        depth_out = depth_abs.reshape(B, S, H, W, 1)
 
         return {
             "depth":        depth_out,
@@ -416,38 +383,55 @@ class VGGTScaleDepth(nn.Module):
 
     # ── Optimizer helper ──────────────────────────────────────────────────────
 
-    def trainable_parameter_groups(self, backbone_lr: float = 1e-5) -> list:
+    def trainable_parameter_groups(
+        self,
+        backbone_lr: float = 1e-5,
+        depth_head_lr: float = 1e-5,
+    ) -> list:
         """
-        Returns parameter groups suitable for AdamW.
+        Returns parameter groups for AdamW.
 
-        Suggested learning rates:
-            new params (scale_token, scale_mlp, fuse_conv) : 1e-3
-            backbone fine-tune (optional)                   : 1e-5
+        Learning rate guidelines:
+            scale_token / scale_mlp / fuse_conv : 1e-3
+            depth_head (finetune)               : 1e-5
+            backbone blocks (optional)          : 1e-5
         """
-        return [
+        groups = [
             {
-                "params":  [self.aggregator.scale_token],
-                "lr":      1e-3,
-                "name":    "scale_token",
+                "params": [self.aggregator.scale_token],
+                "lr":     1e-3,
+                "name":   "scale_token",
             },
             {
-                "params":  list(self.scale_mlp.parameters()),
-                "lr":      1e-3,
-                "name":    "scale_mlp",
+                "params": list(self.scale_mlp.parameters()),
+                "lr":     1e-3,
+                "name":   "scale_mlp",
             },
             {
-                "params":  list(self.fuse_conv.parameters()),
-                "lr":      1e-3,
-                "name":    "fuse_conv",
+                "params": list(self.fuse_conv.parameters()),
+                "lr":     1e-3,
+                "name":   "fuse_conv",
             },
-            # Uncomment to fine-tune backbone blocks at lower LR:
-            # {
-            #     "params":  list(self.aggregator.frame_blocks.parameters()) +
-            #                list(self.aggregator.global_blocks.parameters()),
-            #     "lr":      backbone_lr,
-            #     "name":    "backbone_blocks",
-            # },
         ]
+
+        # depth_head — only added when it has trainable parameters
+        depth_head_params = [p for p in self.depth_head.parameters() if p.requires_grad]
+        if depth_head_params:
+            groups.append({
+                "params": depth_head_params,
+                "lr":     depth_head_lr,
+                "name":   "depth_head",
+            })
+
+        # Uncomment to fine-tune backbone blocks at lower LR:
+        # groups.append({
+        #     "params": list(self.aggregator.frame_blocks.parameters()) +
+        #               list(self.aggregator.global_blocks.parameters()),
+        #     "lr":     backbone_lr,
+        #     "name":   "backbone_blocks",
+        # })
+
+        return groups
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -464,34 +448,26 @@ def scale_depth_loss(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    Combines:
-        SILog loss  — scale-invariant log depth, standard for monocular depth
-        Scale L1    — optional direct scale supervision when GT is available
-        Confidence  — optional confidence weighting from DPT head
+    Combines SILog + optional scale L1 + optional confidence weighting.
 
     Args:
         depth_pred   [B, S, H, W, 1]
-        depth_gt     [B, S, H, W, 1]   (values <= 0 are treated as invalid)
+        depth_gt     [B, S, H, W, 1]   (values <= 0 treated as invalid)
         scale_factor [B, 1] or [B*S, 1]
         scale_gt     [B, 1] optional
-        conf         [B, S, H, W]  optional confidence weights
+        conf         [B, S, H, W] optional
     """
-    pred = depth_pred.squeeze(-1)   # [B, S, H, W]
+    pred = depth_pred.squeeze(-1)
     gt   = depth_gt.squeeze(-1)
-
     mask = (gt > eps) & (pred > eps)
 
-    if conf is not None:
-        w = conf[mask]
-    else:
-        w = torch.ones(mask.sum(), device=pred.device)
+    w = conf[mask] if conf is not None else torch.ones(mask.sum(), device=pred.device)
 
     log_diff = torch.log(pred[mask] + eps) - torch.log(gt[mask] + eps)
     silog    = (w * log_diff ** 2).sum() / w.sum() \
              - 0.5 * ((w * log_diff).sum() / w.sum()) ** 2
 
     loss = silog
-
     if scale_gt is not None:
         loss = loss + lambda_scale * torch.abs(scale_factor - scale_gt).mean()
 
@@ -507,38 +483,37 @@ if __name__ == "__main__":
     pretrained = VGGT.from_pretrained("facebook/VGGT-1B")
     pretrained = pretrained.cuda().eval()
 
-    print("Building VGGTScaleDepth...")
+    print("Building VGGTScaleDepth (freeze_depth_head=False)...")
     model = VGGTScaleDepth(
         pretrained_vggt=pretrained,
         embed_dim=1024,
         freeze_backbone=True,
+        freeze_depth_head=False,
         scale_per_frame=False,
     ).cuda()
 
-    # Print trainable params
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    print(f"Trainable: {trainable:,}  /  Total: {total:,}  "
-          f"({100 * trainable / total:.2f}%)")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total:     {total / 1e6:.1f}M")
+    print(f"Trainable: {trainable / 1e6:.3f}M")
+    for g in model.trainable_parameter_groups():
+        n = sum(p.numel() for p in g["params"])
+        print(f"  {g['name']:20s}: {n / 1e6:.3f}M  lr={g['lr']}")
 
-    # Token layout check
-    print(f"scale_token_idx : {model.scale_token_idx}")   # should be 5
-    print(f"patch_start_idx : {model.aggregator.patch_start_idx}")   # should be 6
+    print(f"scale_token_idx : {model.scale_token_idx}")
+    print(f"patch_start_idx : {model.aggregator.patch_start_idx}")
 
-    # Forward
-    dummy = torch.rand(2, 4, 3, 518, 518).cuda()  # B=2, S=4 frames
+    dummy = torch.rand(2, 4, 3, 518, 518).cuda()
     with torch.no_grad():
         out = model(dummy)
 
-    print("depth      :", out["depth"].shape)        # [2, 4, H, W, 1]
-    print("depth_conf :", out["depth_conf"].shape)   # [2, 4, H, W]
-    print("scale      :", out["scale_factor"].shape) # [2, 1]
+    print("depth      :", out["depth"].shape)
+    print("depth_conf :", out["depth_conf"].shape)
+    print("scale      :", out["scale_factor"].shape)
     print("scale values:", out["scale_factor"].squeeze())
 
-    # Build optimizer
     optimizer = torch.optim.AdamW(
-        model.trainable_parameter_groups(),
-        weight_decay=1e-4,
+        model.trainable_parameter_groups(), weight_decay=1e-4
     )
     print("Optimizer built successfully.")
     print("\nDone.")
