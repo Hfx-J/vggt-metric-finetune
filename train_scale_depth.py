@@ -20,7 +20,7 @@ CONFIG = {
     "batch_size":         4,            # depth_head 微调显存开销大，从 2 开始
     "num_epochs":         50,
     "lr_new":             1e-3,         # scale_token / scale_mlp / fuse_conv
-    "lr_depth_head":      1e-8,         # depth_head 微调学习率（比新增模块低 100x）
+    "lr_depth_head":      1e-6,         # depth_head 微调学习率（比新增模块低 100x）
     "weight_decay":       1e-4,
     "freeze_depth_head":  False,        # ← True = 冻结 depth_head；False = 微调
     "save_dir":           "./checkpoints_scale",

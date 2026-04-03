@@ -151,3 +151,4 @@ input_images_*/
 wandb/
 checkpoints/
 .github/copilot-instructions.md
+checkpoints_scale/
