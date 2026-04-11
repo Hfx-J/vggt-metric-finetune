@@ -73,11 +73,11 @@ CONFIG = {
     "nyu_sample_ratio": 0.5,
     # ── Training ──────────────────────────────────────────────────────────
     "batch_size":     4,
-    "num_epochs":     60,
-    "lr_new":         1e-3,
-    "lr_lora":        1e-4,
-    "lr_depth_head":  1e-6,
-    "weight_decay":   1e-4,
+    "num_epochs":     30,
+    "lr_new":             1e-3,   # scale_token / scale_mlp / fuse_conv
+    "lr_lora":            6e-4,   # LoRA A/B matrices in the backbone
+    "lr_depth_head":      2e-6,   # depth_head fine-tune (100× smaller)
+    "weight_decay":       1e-4,
     "freeze_depth_head": False,
     # ── LoRA ──────────────────────────────────────────────────────────────
     "lora_rank":      8,
@@ -107,7 +107,11 @@ def is_ddp() -> bool:
     return "RANK" in os.environ
 
 def setup_ddp() -> int:
-    dist.init_process_group(backend="nccl")
+    import datetime
+    dist.init_process_group(
+        backend="nccl",
+        timeout=datetime.timedelta(hours=4),   # 默认 10 分钟太短，验证集大时会超时
+    )
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
@@ -117,6 +121,14 @@ def cleanup_ddp() -> None:
 
 def is_main() -> bool:
     return dist.get_rank() == 0 if is_ddp() else True
+
+def allreduce_scalar(val: float, device: torch.device) -> float:
+    """对单个标量在所有 rank 间求均值（DDP 时使用，单卡直接返回原值）。"""
+    if not is_ddp():
+        return val
+    t = torch.tensor(val, dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return (t / dist.get_world_size()).item()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,16 +537,24 @@ def main() -> None:
                 "epoch":            epoch + 1,
             }, step=global_step)
 
-        # ── 6. Validation ───────────────────────────────────────────────────
-        if is_main() and (epoch + 1) % CONFIG["val_interval"] == 0:
+        # ── 6. Validation — 所有 rank 都参与，all_reduce 汇总 ──────────────
+        # 关键：不能只让 rank 0 跑验证，否则其他 rank 在 barrier 处等待超时。
+        if (epoch + 1) % CONFIG["val_interval"] == 0:
             model.eval()
 
             def _run_val(loader: DataLoader, tag: str) -> dict:
-                metrics_acc = defaultdict(list)
-                scale_acc   = []
+                """
+                所有 rank 各自跑自己的分片（DistributedSampler 已切分），
+                最后用 all_reduce 把各 rank 的累计和聚合为全局均值。
+                """
+                metric_keys = ["d1", "d2", "abs_rel", "rmse", "scale"]
+                # 用 sum + count 两个变量来做全局均值，避免 list 跨进程传输
+                local_sums   = {k: 0.0 for k in metric_keys}
+                local_counts = {k: 0   for k in metric_keys}
 
                 with torch.no_grad():
-                    for batch in tqdm(loader, desc=f"Val-{tag}"):
+                    for batch in tqdm(loader, desc=f"Val-{tag}",
+                                      disable=not is_main()):
                         images   = batch["image"].unsqueeze(1).to(device).to(dtype)
                         gt_depth = batch["depth"].to(device).float()
                         max_d    = batch["max_depth"].to(device)
@@ -542,9 +562,11 @@ def main() -> None:
                         with torch.cuda.amp.autocast(dtype=dtype):
                             out = model(images)
 
-                        pred = out["depth"].squeeze(1).squeeze(-1).float()  # [B,H,W]
-                        gt   = gt_depth.squeeze(1)                          # [B,H,W]
-                        scale_acc.append(out["scale_factor"].float().mean().item())
+                        pred = out["depth"].squeeze(1).squeeze(-1).float()
+                        gt   = gt_depth.squeeze(1)
+
+                        local_sums["scale"]   += out["scale_factor"].float().mean().item()
+                        local_counts["scale"] += 1
 
                         for i in range(pred.shape[0]):
                             cap  = max_d[i].item()
@@ -553,67 +575,76 @@ def main() -> None:
                                 continue
                             m = compute_metrics(pred[i], gt[i], mask)
                             for k, v in m.items():
-                                metrics_acc[k].append(v)
+                                local_sums[k]   += v
+                                local_counts[k] += 1
 
-                avg = {k: sum(v) / len(v) for k, v in metrics_acc.items()}
-                avg["scale"] = sum(scale_acc) / len(scale_acc)
+                # all_reduce：把各 rank 的 sum 和 count 加总
+                avg = {}
+                for k in metric_keys:
+                    s = allreduce_scalar(local_sums[k],   device)
+                    c = allreduce_scalar(float(local_counts[k]), device)
+                    avg[k] = s / c if c > 0 else 0.0
                 return avg
 
-            avg_nyu   = _run_val(val_nyu_loader,   "NYU")
-            avg_kitti = _run_val(val_kitti_loader,  "KITTI")
+            avg_nyu   = _run_val(val_nyu_loader,  "NYU")
+            avg_kitti = _run_val(val_kitti_loader, "KITTI")
 
-            print(
-                f"\n📊 Epoch {epoch+1} — NYU  : "
-                f"AbsRel={avg_nyu['abs_rel']:.4f}  RMSE={avg_nyu['rmse']:.4f}  "
-                f"δ1={avg_nyu['d1']:.4f}  scale={avg_nyu['scale']:.4f}"
-            )
-            print(
-                f"📊 Epoch {epoch+1} — KITTI: "
-                f"AbsRel={avg_kitti['abs_rel']:.4f}  RMSE={avg_kitti['rmse']:.4f}  "
-                f"δ1={avg_kitti['d1']:.4f}  scale={avg_kitti['scale']:.4f}\n"
-            )
+            # 验证结束，所有 rank 切回训练模式
+            model.train()
 
-            wandb.log({
-                "val_nyu/abs_rel":    avg_nyu["abs_rel"],
-                "val_nyu/rmse":       avg_nyu["rmse"],
-                "val_nyu/d1":         avg_nyu["d1"],
-                "val_nyu/scale":      avg_nyu["scale"],
-                "val_kitti/abs_rel":  avg_kitti["abs_rel"],
-                "val_kitti/rmse":     avg_kitti["rmse"],
-                "val_kitti/d1":       avg_kitti["d1"],
-                "val_kitti/scale":    avg_kitti["scale"],
-            }, step=global_step)
-
-            # ── Checkpoint: save when either domain improves ───────────────
-            improved = False
-            if avg_nyu["abs_rel"] < best_abs_rel_nyu:
-                best_abs_rel_nyu = avg_nyu["abs_rel"]
-                improved = True
-            if avg_kitti["abs_rel"] < best_abs_rel_kitti:
-                best_abs_rel_kitti = avg_kitti["abs_rel"]
-                improved = True
-
-            if improved:
-                ckpt = {
-                    "epoch":          epoch + 1,
-                    "lora_rank":      CONFIG["lora_rank"],
-                    "lora_alpha":     CONFIG["lora_alpha"],
-                    "adapter_state":  raw_model.lora_state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "metrics_nyu":    avg_nyu,
-                    "metrics_kitti":  avg_kitti,
-                    "config":         CONFIG,
-                }
-                torch.save(ckpt, os.path.join(CONFIG["save_dir"], "best_ckpt.pth"))
+            if is_main():
                 print(
-                    f"   ✅ Saved best — "
-                    f"NYU AbsRel={best_abs_rel_nyu:.4f}  "
-                    f"KITTI AbsRel={best_abs_rel_kitti:.4f}"
+                    f"\n📊 Epoch {epoch+1} — NYU  : "
+                    f"AbsRel={avg_nyu['abs_rel']:.4f}  RMSE={avg_nyu['rmse']:.4f}  "
+                    f"δ1={avg_nyu['d1']:.4f}  scale={avg_nyu['scale']:.4f}"
                 )
-                wandb.run.summary["best_abs_rel_nyu"]   = best_abs_rel_nyu
-                wandb.run.summary["best_abs_rel_kitti"] = best_abs_rel_kitti
-                wandb.run.summary["best_epoch"]         = epoch + 1
+                print(
+                    f"📊 Epoch {epoch+1} — KITTI: "
+                    f"AbsRel={avg_kitti['abs_rel']:.4f}  RMSE={avg_kitti['rmse']:.4f}  "
+                    f"δ1={avg_kitti['d1']:.4f}  scale={avg_kitti['scale']:.4f}\n"
+                )
 
+                wandb.log({
+                    "val_nyu/abs_rel":    avg_nyu["abs_rel"],
+                    "val_nyu/rmse":       avg_nyu["rmse"],
+                    "val_nyu/d1":         avg_nyu["d1"],
+                    "val_nyu/scale":      avg_nyu["scale"],
+                    "val_kitti/abs_rel":  avg_kitti["abs_rel"],
+                    "val_kitti/rmse":     avg_kitti["rmse"],
+                    "val_kitti/d1":       avg_kitti["d1"],
+                    "val_kitti/scale":    avg_kitti["scale"],
+                }, step=global_step)
+
+                improved = False
+                if avg_nyu["abs_rel"] < best_abs_rel_nyu:
+                    best_abs_rel_nyu = avg_nyu["abs_rel"]
+                    improved = True
+                if avg_kitti["abs_rel"] < best_abs_rel_kitti:
+                    best_abs_rel_kitti = avg_kitti["abs_rel"]
+                    improved = True
+
+                if improved:
+                    ckpt = {
+                        "epoch":           epoch + 1,
+                        "lora_rank":       CONFIG["lora_rank"],
+                        "lora_alpha":      CONFIG["lora_alpha"],
+                        "adapter_state":   raw_model.lora_state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "metrics_nyu":     avg_nyu,
+                        "metrics_kitti":   avg_kitti,
+                        "config":          CONFIG,
+                    }
+                    torch.save(ckpt, os.path.join(CONFIG["save_dir"], "best_ckpt.pth"))
+                    print(
+                        f"   ✅ Saved best — "
+                        f"NYU AbsRel={best_abs_rel_nyu:.4f}  "
+                        f"KITTI AbsRel={best_abs_rel_kitti:.4f}"
+                    )
+                    wandb.run.summary["best_abs_rel_nyu"]   = best_abs_rel_nyu
+                    wandb.run.summary["best_abs_rel_kitti"] = best_abs_rel_kitti
+                    wandb.run.summary["best_epoch"]         = epoch + 1
+
+        # 每个 epoch 结尾的 barrier：两个 rank 都会到达这里（验证已同步完毕）
         if use_ddp:
             dist.barrier()
 

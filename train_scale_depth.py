@@ -18,11 +18,11 @@ CONFIG = {
     "img_size":           518,
     "max_depth":          10.0,
     "batch_size":         4,
-    "num_epochs":         50,
+    "num_epochs":         30,
     # ── Learning rates ────────────────────────────────────────────────────
     "lr_new":             1e-3,   # scale_token / scale_mlp / fuse_conv
-    "lr_lora":            1e-4,   # LoRA A/B matrices in the backbone
-    "lr_depth_head":      1e-6,   # depth_head fine-tune (100× smaller)
+    "lr_lora":            6e-4,   # LoRA A/B matrices in the backbone
+    "lr_depth_head":      2e-6,   # depth_head fine-tune (100× smaller)
     "weight_decay":       1e-4,
     # ── Freeze flags ─────────────────────────────────────────────────────
     "freeze_depth_head":  False,  # True = freeze depth_head entirely

@@ -152,3 +152,5 @@ wandb/
 checkpoints/
 .github/copilot-instructions.md
 checkpoints_scale/
+checkpoints_mixed/
+vis_output/
